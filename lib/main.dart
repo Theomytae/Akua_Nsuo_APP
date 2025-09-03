@@ -1,4 +1,17 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
+import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:permission_handler/permission_handler.dart';
+
+// --- BLE UUIDs (Must match your ESP32 firmware) ---
+const String esp32ServiceUuid = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
+const String dataCharUuid = 'beb5483e-36e1-4688-b7f5-ea07361b26a8';
+const String debugCharUuid = 'f4a1f353-8576-4993-81b4-1101b0596348';
+const String uptimeCharUuid = 'a8f5f247-3665-448d-8a0c-6b3a2a3e592b';
+const String rebootCharUuid = 'b2d49a43-6c84-474c-a496-02d997e54f8e';
 
 void main() {
   runApp(const MyApp());
@@ -7,116 +20,399 @@ void main() {
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
 
-  // This widget is the root of your application.
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Flutter Demo',
-      theme: ThemeData(
-        // This is the theme of your application.
-        //
-        // TRY THIS: Try running your application with "flutter run". You'll see
-        // the application has a purple toolbar. Then, without quitting the app,
-        // try changing the seedColor in the colorScheme below to Colors.green
-        // and then invoke "hot reload" (save your changes or press the "hot
-        // reload" button in a Flutter-supported IDE, or press "r" if you used
-        // the command line to start the app).
-        //
-        // Notice that the counter didn't reset back to zero; the application
-        // state is not lost during the reload. To reset the state, use hot
-        // restart instead.
-        //
-        // This works for code too, not just values: Most code changes can be
-        // tested with just a hot reload.
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
+      title: 'ESP32 Controller',
+      theme: ThemeData.dark().copyWith(
+        scaffoldBackgroundColor: const Color(0xFF111827),
+        primaryColor: const Color(0xFF2563eb),
+        cardColor: const Color(0xFF1f2937),
       ),
-      home: const MyHomePage(title: 'Flutter Demo Home Page'),
+      home: const ESP32ControllerScreen(),
     );
   }
 }
 
-class MyHomePage extends StatefulWidget {
-  const MyHomePage({super.key, required this.title});
-
-  // This widget is the home page of your application. It is stateful, meaning
-  // that it has a State object (defined below) that contains fields that affect
-  // how it looks.
-
-  // This class is the configuration for the state. It holds the values (in this
-  // case the title) provided by the parent (in this case the App widget) and
-  // used by the build method of the State. Fields in a Widget subclass are
-  // always marked "final".
-
-  final String title;
+class ESP32ControllerScreen extends StatefulWidget {
+  const ESP32ControllerScreen({super.key});
 
   @override
-  State<MyHomePage> createState() => _MyHomePageState();
+  State<ESP32ControllerScreen> createState() => _ESP32ControllerScreenState();
 }
 
-class _MyHomePageState extends State<MyHomePage> {
-  int _counter = 0;
+class _ESP32ControllerScreenState extends State<ESP32ControllerScreen> {
+  // --- State Variables ---
+  BluetoothDevice? _connectedDevice;
+  StreamSubscription<BluetoothConnectionState>? _connectionStateSubscription;
+  String _status = 'Disconnected';
+  final TextEditingController _dataToSendController = TextEditingController();
+  String _receivedData = '';
+  Map<String, dynamic>? _debugData;
+  String _uptime = '00:00:00';
 
-  void _incrementCounter() {
-    setState(() {
-      // This call to setState tells the Flutter framework that something has
-      // changed in this State, which causes it to rerun the build method below
-      // so that the display can reflect the updated values. If we changed
-      // _counter without calling setState(), then the build method would not be
-      // called again, and so nothing would appear to happen.
-      _counter++;
-    });
+  // --- Characteristics ---
+  BluetoothCharacteristic? _dataChar;
+  BluetoothCharacteristic? _rebootChar;
+  StreamSubscription? _debugSubscription;
+  StreamSubscription? _uptimeSubscription;
+
+  @override
+  void initState() {
+    super.initState();
+    _requestPermissions();
+  }
+
+  Future<void> _requestPermissions() async {
+    // Request multiple permissions at once.
+    Map<Permission, PermissionStatus> statuses = await [
+      Permission.bluetoothScan,
+      Permission.bluetoothConnect,
+      Permission.location,
+    ].request();
+
+    if (statuses[Permission.bluetoothScan] != PermissionStatus.granted ||
+        statuses[Permission.bluetoothConnect] != PermissionStatus.granted ||
+        statuses[Permission.location] != PermissionStatus.granted) {
+       _showErrorDialog('Permissions Required', 'Please grant Bluetooth and Location permissions for the app to function.');
+    }
   }
 
   @override
+  void dispose() {
+    _connectionStateSubscription?.cancel();
+    _debugSubscription?.cancel();
+    _uptimeSubscription?.cancel();
+    _connectedDevice?.disconnect();
+    _dataToSendController.dispose();
+    super.dispose();
+  }
+
+  // --- Core BLE Functions ---
+  void _scanAndConnect() async {
+    var scanStatus = await Permission.bluetoothScan.status;
+    var locationStatus = await Permission.location.status;
+    if (!scanStatus.isGranted || !locationStatus.isGranted) {
+        _showErrorDialog('Permissions Required', 'Bluetooth Scan and Location permissions must be granted to find devices.');
+        _requestPermissions();
+        return;
+    }
+
+    setState(() {
+      _status = 'Scanning...';
+    });
+
+    try {
+      await FlutterBluePlus.startScan(
+        withServices: [Guid(esp32ServiceUuid)],
+        timeout: const Duration(seconds: 15),
+      );
+
+      FlutterBluePlus.scanResults.listen((results) {
+        if (results.isNotEmpty) {
+          final device = results.last.device;
+          FlutterBluePlus.stopScan();
+          _connectToDevice(device);
+        }
+      });
+    } catch (e) {
+      _showErrorDialog('Scan Error', 'Could not start scanning. Please ensure Bluetooth and Location are enabled on your device.');
+      setState(() {
+        _status = 'Scan Failed';
+      });
+    }
+  }
+
+  void _connectToDevice(BluetoothDevice device) async {
+    setState(() {
+      _status = 'Connecting to ${device.platformName}...';
+    });
+    try {
+      await device.connect();
+      _connectionStateSubscription = device.connectionState.listen((state) {
+        if (state == BluetoothConnectionState.disconnected) {
+          _onDisconnected();
+        }
+      });
+      _onConnected(device);
+    } catch (e) {
+      _showErrorDialog('Connection Error', 'Failed to connect to ${device.platformName}.');
+      _onDisconnected();
+    }
+  }
+
+  void _onConnected(BluetoothDevice device) async {
+    setState(() {
+      _connectedDevice = device;
+      _status = 'Connected to ${device.platformName}';
+    });
+
+    List<BluetoothService> services = await device.discoverServices();
+    for (var service in services) {
+      if (service.uuid == Guid(esp32ServiceUuid)) {
+        for (var char in service.characteristics) {
+          if (char.uuid == Guid(dataCharUuid)) _dataChar = char;
+          if (char.uuid == Guid(rebootCharUuid)) _rebootChar = char;
+          if (char.uuid == Guid(debugCharUuid)) _monitorDebug(char);
+          if (char.uuid == Guid(uptimeCharUuid)) _monitorUptime(char);
+        }
+      }
+    }
+  }
+
+  void _onDisconnected() {
+    setState(() {
+      _connectedDevice = null;
+      _status = 'Disconnected';
+      _debugData = null;
+      _uptime = '00:00:00';
+    });
+    _debugSubscription?.cancel();
+    _uptimeSubscription?.cancel();
+  }
+
+  void _disconnectDevice() async {
+    await _connectedDevice?.disconnect();
+  }
+
+  // --- Characteristic Interactions ---
+  void _sendData() async {
+    if (_dataChar != null && _dataToSendController.text.isNotEmpty) {
+      List<int> bytes = utf8.encode(_dataToSendController.text);
+      await _dataChar!.write(bytes);
+    }
+  }
+
+  void _readData() async {
+    if (_dataChar != null) {
+      List<int> value = await _dataChar!.read();
+      setState(() {
+        _receivedData = utf8.decode(value);
+      });
+    }
+  }
+  
+  void _rebootDevice() async {
+    if (_rebootChar != null) {
+      await _rebootChar!.write([1]);
+    }
+  }
+  
+  void _monitorDebug(BluetoothCharacteristic char) async {
+    await char.setNotifyValue(true);
+    _debugSubscription = char.lastValueStream.listen((value) {
+      final jsonString = utf8.decode(value);
+      try {
+        setState(() {
+          _debugData = jsonDecode(jsonString);
+        });
+      } catch (e) {
+        // Handle non-JSON data if necessary
+      }
+    });
+  }
+  
+  void _monitorUptime(BluetoothCharacteristic char) async {
+    await char.setNotifyValue(true);
+    _uptimeSubscription = char.lastValueStream.listen((value) {
+      final secondsTotal = ByteData.sublistView(Uint8List.fromList(value)).getUint32(0, Endian.little);
+      final duration = Duration(seconds: secondsTotal);
+      String twoDigits(int n) => n.toString().padLeft(2, '0');
+      final hours = twoDigits(duration.inHours);
+      final minutes = twoDigits(duration.inMinutes.remainder(60));
+      final seconds = twoDigits(duration.inSeconds.remainder(60));
+      setState(() {
+        _uptime = '$hours:$minutes:$seconds';
+      });
+    });
+  }
+
+  void _showErrorDialog(String title, String content) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(title),
+        content: Text(content),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text('OK')),
+        ],
+      ),
+    );
+  }
+
+  // --- Widgets ---
+  @override
   Widget build(BuildContext context) {
-    // This method is rerun every time setState is called, for instance as done
-    // by the _incrementCounter method above.
-    //
-    // The Flutter framework has been optimized to make rerunning build methods
-    // fast, so that you can just rebuild anything that needs updating rather
-    // than having to individually change instances of widgets.
     return Scaffold(
       appBar: AppBar(
-        // TRY THIS: Try changing the color here to a specific color (to
-        // Colors.amber, perhaps?) and trigger a hot reload to see the AppBar
-        // change color while the other colors stay the same.
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        // Here we take the value from the MyHomePage object that was created by
-        // the App.build method, and use it to set our appbar title.
-        title: Text(widget.title),
+        title: const Text('ESP32 Flutter Controller'),
+        backgroundColor: Theme.of(context).scaffoldBackgroundColor,
+        elevation: 0,
       ),
-      body: Center(
-        // Center is a layout widget. It takes a single child and positions it
-        // in the middle of the parent.
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(16.0),
         child: Column(
-          // Column is also a layout widget. It takes a list of children and
-          // arranges them vertically. By default, it sizes itself to fit its
-          // children horizontally, and tries to be as tall as its parent.
-          //
-          // Column has various properties to control how it sizes itself and
-          // how it positions its children. Here we use mainAxisAlignment to
-          // center the children vertically; the main axis here is the vertical
-          // axis because Columns are vertical (the cross axis would be
-          // horizontal).
-          //
-          // TRY THIS: Invoke "debug painting" (choose the "Toggle Debug Paint"
-          // action in the IDE, or press "p" in the console), to see the
-          // wireframe for each widget.
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: <Widget>[
-            const Text('You have pushed the button this many times:'),
-            Text(
-              '$_counter',
-              style: Theme.of(context).textTheme.headlineMedium,
+          children: [
+            _buildConnectionCard(),
+            if (_connectedDevice != null) ...[
+              const SizedBox(height: 16),
+              _buildDataExchangeCard(),
+              const SizedBox(height: 16),
+              _buildDebugViewCard(),
+              const SizedBox(height: 16),
+              _buildSystemInfoCard(),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildConnectionCard() {
+    return Card(
+      elevation: 4,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      child: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('Connection', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Container(
+                  width: 12,
+                  height: 12,
+                  decoration: BoxDecoration(
+                    color: _connectedDevice != null ? Colors.green.shade400 : Colors.red.shade400,
+                    shape: BoxShape.circle,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Text(_status, style: const TextStyle(fontSize: 16)),
+              ],
+            ),
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton(
+                onPressed: _connectedDevice != null ? _disconnectDevice : _scanAndConnect,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Theme.of(context).primaryColor,
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                ),
+                child: Text(_connectedDevice != null ? 'Disconnect' : 'Connect to ESP32', style: const TextStyle(fontSize: 16, color: Colors.white)),
+              ),
             ),
           ],
         ),
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _incrementCounter,
-        tooltip: 'Increment',
-        child: const Icon(Icons.add),
-      ), // This trailing comma makes auto-formatting nicer for build methods.
+    );
+  }
+  
+  Widget _buildDataExchangeCard() {
+    return Card(
+      elevation: 4,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      child: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('Data Exchange', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _dataToSendController,
+              decoration: const InputDecoration(
+                labelText: 'Send Data',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 8),
+            ElevatedButton(onPressed: _sendData, child: const Text('Send')),
+            const SizedBox(height: 16),
+            const Text('Received Data', style: TextStyle(fontWeight: FontWeight.w600)),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(12),
+              margin: const EdgeInsets.only(top: 8),
+              decoration: BoxDecoration(
+                color: Colors.black26,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Text(_receivedData.isEmpty ? ' ' : _receivedData),
+            ),
+            const SizedBox(height: 8),
+            ElevatedButton(onPressed: _readData, child: const Text('Read')),
+          ],
+        ),
+      ),
+    );
+  }
+  
+  Widget _buildDebugViewCard() {
+    return Card(
+        child: Padding(
+            padding: const EdgeInsets.all(16.0),
+            child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                    const Text('Debug View', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+                    const SizedBox(height: 12),
+                    Container(
+                        width: double.infinity,
+                        height: 150,
+                        padding: const EdgeInsets.all(12.0),
+                        decoration: BoxDecoration(
+                            color: Colors.black,
+                            borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: _debugData == null 
+                            ? const Text('Waiting for debug data...', style: TextStyle(color: Colors.greenAccent))
+                            : ListView(
+                                children: _debugData!.entries.map((entry) => Text(
+                                    '${entry.key}: ${entry.value}',
+                                    style: const TextStyle(color: Colors.greenAccent, fontFamily: 'monospace'),
+                                )).toList(),
+                            )
+                    )
+                ]
+            )
+        )
+    );
+  }
+  
+  Widget _buildSystemInfoCard() {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('System Info', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 12),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const Text('Uptime:', style: TextStyle(fontSize: 16)),
+                Text(_uptime, style: const TextStyle(fontSize: 18, fontFamily: 'monospace', fontWeight: FontWeight.bold)),
+              ],
+            ),
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton(
+                onPressed: _rebootDevice,
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.red.shade700),
+                child: const Text('Reboot ESP32', style: TextStyle(color: Colors.white)),
+              ),
+            )
+          ],
+        ),
+      ),
     );
   }
 }
+
