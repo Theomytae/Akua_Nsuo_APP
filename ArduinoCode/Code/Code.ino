@@ -28,6 +28,7 @@
 #include <BLE2902.h>
 #include <ArduinoJson.h>
 #include <Preferences.h> // For Non-Volatile Storage
+#include "esp32-hal-ledc.h" // Explicitly include for PWM functions
 
 // BLE Service and Characteristic UUIDs
 #define SERVICE_UUID                  "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
@@ -37,6 +38,10 @@
 #define DEBUG_CHARACTERISTIC_UUID     "f4a1f353-8576-4993-81b4-1101b0596348"
 #define UPTIME_CHARACTERISTIC_UUID    "a8f5f247-3665-448d-8a0c-6b3a2a3e592b"
 #define REBOOT_CHARACTERISTIC_UUID    "b2d49a43-6c84-474c-a496-02d997e54f8e"
+// New characteristics for Pump Power Control
+#define PUMP_VISIBILITY_UUID          "e0c47e8c-838a-42d3-9b09-2495304e28e4"
+#define PUMP_VALUE_UUID               "e1c47e8c-838a-42d3-9b09-2495304e28e5"
+#define PUMP_ENABLE_UUID              "e2c47e8c-838a-42d3-9b09-2495304e28e6" // For enabling/disabling PWM
 
 // --- Hardware Pin Definitions ---
 // Input pins
@@ -53,6 +58,11 @@
 #define comLed 48
 #define pwmPomp 10
 
+// PWM Properties
+#define PUMP_PWM_CHANNEL 0
+#define PUMP_PWM_FREQ 20000
+#define PUMP_PWM_RESOLUTION 8 // 8-bit resolution for values 0-255
+
 // --- Global Variables ---
 // For Hardware Logic
 unsigned long myTime;
@@ -62,6 +72,8 @@ long timer;
 bool lastState; // Tracks the pump timer cycle
 int floater;    // Holds the state of the floater switch
 int evStatus;   // Derived status from the floater switch
+uint8_t pumpPowerValue = 255; // 0-255 power level for PWM
+bool isPwmEnabled = false;   // Flag to switch between PWM and digital control
 
 // For BLE
 BLECharacteristic *pValueACharacteristic;
@@ -70,6 +82,9 @@ BLECharacteristic *pDataCharacteristic;
 BLECharacteristic *pDebugCharacteristic;
 BLECharacteristic *pUptimeCharacteristic;
 BLECharacteristic *pRebootCharacteristic;
+BLECharacteristic *pPumpPowerVisibilityCharacteristic;
+BLECharacteristic *pPumpPowerValueCharacteristic;
+BLECharacteristic *pPwmEnableCharacteristic;
 bool deviceConnected = false;
 String dataCharacteristicValue = "Hello from ESP32!";
 unsigned long lastUptimeNotifyTime = 0;
@@ -155,6 +170,42 @@ class ValueCallbacks : public BLECharacteristicCallbacks {
   }
 };
 
+// Callback for Pump Power Value and PWM Enable
+class PumpControlCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pCharacteristic) {
+    String uuid = pCharacteristic->getUUID().toString();
+    const String value_uuid = BLEUUID(PUMP_VALUE_UUID).toString();
+    const String enable_uuid = BLEUUID(PUMP_ENABLE_UUID).toString();
+    uint8_t* data = pCharacteristic->getData();
+    size_t len = pCharacteristic->getLength();
+
+    if (data != nullptr && len == 1) {
+      uint8_t value = data[0];
+      preferences.begin("ble-settings", false);
+
+      if (uuid == value_uuid) {
+        pumpPowerValue = value;
+        Serial.print("Set Pump Power Value to: ");
+        Serial.println(pumpPowerValue);
+        preferences.putUChar("pumpPower", pumpPowerValue);
+      } else if (uuid == enable_uuid) {
+        isPwmEnabled = (value == 1);
+        Serial.print("Set PWM Enabled to: ");
+        Serial.println(isPwmEnabled);
+        preferences.putBool("pwmEnabled", isPwmEnabled);
+
+        // Attach or detach the pin from PWM controller
+        if (isPwmEnabled) {
+          ledcAttach(pwmPomp, PUMP_PWM_FREQ, PUMP_PWM_RESOLUTION);
+        } else {
+          ledcDetach(pwmPomp);
+        }
+      }
+      preferences.end();
+    }
+  }
+};
+
 
 void setup() {
   Serial.begin(115200);
@@ -164,12 +215,18 @@ void setup() {
   preferences.begin("ble-settings", true); // Namespace, read-only mode
   onTime = preferences.getUInt("onTime", 720000);   // Load onTime, default to 12 minutes
   offTime = preferences.getUInt("offTime", 2880000); // Load offTime, default to 48 minutes
+  pumpPowerValue = preferences.getUChar("pumpPower", 255); // Load pump power, default 255
+  isPwmEnabled = preferences.getBool("pwmEnabled", false);  // Load PWM status, default false
   preferences.end();
 
   Serial.print("Loaded onTime from NVS: ");
   Serial.println(onTime);
   Serial.print("Loaded offTime from NVS: ");
   Serial.println(offTime);
+  Serial.print("Loaded Pump Power from NVS: ");
+  Serial.println(pumpPowerValue);
+  Serial.print("Loaded PWM Enabled from NVS: ");
+  Serial.println(isPwmEnabled);
 
   // --- Sending values over serial in a structured format for parsing ---
   Serial.print("ONTIME:");
@@ -197,6 +254,15 @@ void setup() {
   digitalWrite(a1Switch, LOW);
   digitalWrite(comLed, LOW); // Start with communication LED off
 
+  // --- PWM Setup ---
+  // ledcSetup is often combined into ledcAttach in newer cores
+  if (isPwmEnabled) {
+    ledcAttach(pwmPomp, PUMP_PWM_FREQ, PUMP_PWM_RESOLUTION);
+  }
+  // The line below might be needed if your motor driver requires an inverted signal
+  // ledcOutputInvert(PUMP_PWM_CHANNEL, true);
+
+
   // --- Initialize BLE ---
   BLEDevice::init("ESP32-S3 Controller");
   BLEServer *pServer = BLEDevice::createServer();
@@ -212,6 +278,22 @@ void setup() {
   pValueBCharacteristic = pService->createCharacteristic(VALUE_B_CHARACTERISTIC_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
   pValueBCharacteristic->setValue(offTime);
   pValueBCharacteristic->setCallbacks(new ValueCallbacks());
+
+  // Pump Power Visibility Characteristic (Read-Only Feature Flag)
+  pPumpPowerVisibilityCharacteristic = pService->createCharacteristic(PUMP_VISIBILITY_UUID, BLECharacteristic::PROPERTY_READ);
+  uint8_t visibilityVal = 1;
+  pPumpPowerVisibilityCharacteristic->setValue(&visibilityVal, 1); // Enable visibility in the app
+
+  // Pump Power Value Characteristic
+  pPumpPowerValueCharacteristic = pService->createCharacteristic(PUMP_VALUE_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
+  pPumpPowerValueCharacteristic->setValue(&pumpPowerValue, 1);
+  pPumpPowerValueCharacteristic->setCallbacks(new PumpControlCallbacks());
+
+  // PWM Enable Characteristic
+  pPwmEnableCharacteristic = pService->createCharacteristic(PUMP_ENABLE_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
+  uint8_t enableVal = isPwmEnabled ? 1 : 0;
+  pPwmEnableCharacteristic->setValue(&enableVal, 1);
+  pPwmEnableCharacteristic->setCallbacks(new PumpControlCallbacks());
 
   // Data Characteristic
   pDataCharacteristic = pService->createCharacteristic(DATA_CHARACTERISTIC_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
@@ -245,12 +327,22 @@ void loop() {
 
   // Pump timer logic
   if ((myTime > timer) && (lastState == false)) { 
-    digitalWrite(pwmPomp, LOW); // Pump OFF
+    // Pump OFF
+    if (isPwmEnabled) {
+      ledcWrite(PUMP_PWM_CHANNEL, 0);
+    } else {
+      digitalWrite(pwmPomp, LOW);
+    }
     lastState = true;
     timer = millis() + onTime;
   }
   if ((myTime > timer) && (lastState == true)) {
-    digitalWrite(pwmPomp, HIGH); // Pump ON
+    // Pump ON
+    if (isPwmEnabled) {
+      ledcWrite(PUMP_PWM_CHANNEL, pumpPowerValue);
+    } else {
+      digitalWrite(pwmPomp, HIGH);
+    }
     lastState = false;
     timer = millis() + offTime;
   }
@@ -296,6 +388,8 @@ void loop() {
       doc["next_pump_event_ms"] = timer;
       doc["onTime_ms"] = onTime;   // Report current onTime
       doc["offTime_ms"] = offTime; // Report current offTime
+      doc["isPwmEnabled"] = isPwmEnabled;
+      doc["pumpPowerValue"] = pumpPowerValue;
       
       char jsonBuffer[256];
       serializeJson(doc, jsonBuffer);
@@ -307,8 +401,7 @@ void loop() {
       Serial.println(jsonBuffer);
     }
   }
-
+  
   delay(10);
 }
-
 

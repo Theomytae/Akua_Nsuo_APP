@@ -8,12 +8,14 @@ import 'package:permission_handler/permission_handler.dart';
 
 // --- BLE UUIDs (Must match your ESP32 firmware) ---
 const String esp32ServiceUuid = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
-const String dataCharUuid = 'beb5483e-36e1-4688-b7f5-ea07361b26a8';
 const String debugCharUuid = 'f4a1f353-8576-4993-81b4-1101b0596348';
 const String uptimeCharUuid = 'a8f5f247-3665-448d-8a0c-6b3a2a3e592b';
 const String rebootCharUuid = 'b2d49a43-6c84-474c-a496-02d997e54f8e';
 const String onTimeCharUuid = 'c8a3cadd-536c-4819-9154-10a110a19a4e';
 const String offTimeCharUuid = 'd8a3cadd-536c-4819-9154-10a110a19a4f';
+// --- NEW UUIDs for Pump Power ---
+const String pumpPowerVisibilityCharUuid = 'e0c47e8c-838a-42d3-9b09-2495304e28e4';
+const String pumpPowerValueCharUuid = 'e1c47e8c-838a-42d3-9b09-2495304e28e5';
 
 
 void main() {
@@ -31,6 +33,11 @@ class MyApp extends StatelessWidget {
         scaffoldBackgroundColor: const Color(0xFF111827),
         primaryColor: const Color(0xFF2563eb),
         cardColor: const Color(0xFF1f2937),
+        bottomNavigationBarTheme: const BottomNavigationBarThemeData(
+          backgroundColor: Color(0xFF1f2937),
+          selectedItemColor: Color(0xFF2563eb),
+          unselectedItemColor: Colors.grey,
+        ),
       ),
       home: const ESP32ControllerScreen(),
     );
@@ -49,18 +56,19 @@ class _ESP32ControllerScreenState extends State<ESP32ControllerScreen> {
   BluetoothDevice? _connectedDevice;
   StreamSubscription<BluetoothConnectionState>? _connectionStateSubscription;
   String _status = 'Disconnected';
-  final TextEditingController _dataToSendController = TextEditingController();
-  final TextEditingController _valueAController = TextEditingController();
-  final TextEditingController _valueBController = TextEditingController();
-  String _receivedData = '';
+  final TextEditingController _timerOnController = TextEditingController();
+  final TextEditingController _timerOffController = TextEditingController();
+  final TextEditingController _pumpPowerController = TextEditingController();
   Map<String, dynamic>? _debugData;
   String _uptime = '00:00:00';
+  int _selectedIndex = 0;
+  bool _showPumpPowerSection = false;
 
   // --- Characteristics ---
-  BluetoothCharacteristic? _dataChar;
   BluetoothCharacteristic? _rebootChar;
-  BluetoothCharacteristic? _valueAChar;
-  BluetoothCharacteristic? _valueBChar;
+  BluetoothCharacteristic? _timerOnChar;
+  BluetoothCharacteristic? _timerOffChar;
+  BluetoothCharacteristic? _pumpPowerChar;
   StreamSubscription? _debugSubscription;
   StreamSubscription? _uptimeSubscription;
 
@@ -90,9 +98,9 @@ class _ESP32ControllerScreenState extends State<ESP32ControllerScreen> {
     _debugSubscription?.cancel();
     _uptimeSubscription?.cancel();
     _connectedDevice?.disconnect();
-    _dataToSendController.dispose();
-    _valueAController.dispose();
-    _valueBController.dispose();
+    _timerOnController.dispose();
+    _timerOffController.dispose();
+    _pumpPowerController.dispose();
     super.dispose();
   }
 
@@ -167,21 +175,29 @@ class _ESP32ControllerScreenState extends State<ESP32ControllerScreen> {
     });
 
     List<BluetoothService> services = await device.discoverServices();
+    BluetoothCharacteristic? pumpVisibilityChar;
+
     for (var service in services) {
       if (service.uuid == Guid(esp32ServiceUuid)) {
         for (var char in service.characteristics) {
-          if (char.uuid == Guid(dataCharUuid)) _dataChar = char;
           if (char.uuid == Guid(rebootCharUuid)) _rebootChar = char;
           if (char.uuid == Guid(debugCharUuid)) _monitorDebug(char);
           if (char.uuid == Guid(uptimeCharUuid)) _monitorUptime(char);
-          if (char.uuid == Guid(onTimeCharUuid)) _valueAChar = char;
-          if (char.uuid == Guid(offTimeCharUuid)) _valueBChar = char;
+          if (char.uuid == Guid(onTimeCharUuid)) _timerOnChar = char;
+          if (char.uuid == Guid(offTimeCharUuid)) _timerOffChar = char;
+          if (char.uuid == Guid(pumpPowerValueCharUuid)) _pumpPowerChar = char;
+          if (char.uuid == Guid(pumpPowerVisibilityCharUuid)) pumpVisibilityChar = char;
         }
       }
     }
-    // Read initial values after connecting
-    _readValueA();
-    _readValueB();
+
+    // After finding characteristics, check for pump power visibility
+    if (pumpVisibilityChar != null) {
+      await _checkPumpPowerVisibility(pumpVisibilityChar);
+    }
+
+    _readTimerOn();
+    _readTimerOff();
   }
 
   void _onDisconnected() {
@@ -190,8 +206,11 @@ class _ESP32ControllerScreenState extends State<ESP32ControllerScreen> {
       _status = 'Disconnected';
       _debugData = null;
       _uptime = '00:00:00';
-      _valueAController.text = '';
-      _valueBController.text = '';
+      _timerOnController.text = '';
+      _timerOffController.text = '';
+      _pumpPowerController.text = '';
+      _showPumpPowerSection = false;
+      _selectedIndex = 0; // Reset to connection tab
     });
     _debugSubscription?.cancel();
     _uptimeSubscription?.cancel();
@@ -199,19 +218,6 @@ class _ESP32ControllerScreenState extends State<ESP32ControllerScreen> {
 
   void _disconnectDevice() async {
     await _connectedDevice?.disconnect();
-  }
-
-  void _sendData() async {
-    if (_dataChar != null && _dataToSendController.text.isNotEmpty) {
-      await _dataChar!.write(utf8.encode(_dataToSendController.text));
-    }
-  }
-
-  void _readData() async {
-    if (_dataChar != null) {
-      List<int> value = await _dataChar!.read();
-      setState(() { _receivedData = utf8.decode(value); });
-    }
   }
   
   void _rebootDevice() async {
@@ -245,42 +251,79 @@ class _ESP32ControllerScreenState extends State<ESP32ControllerScreen> {
     });
   }
 
-  void _readValueA() async {
-    if (_valueAChar != null) {
-      List<int> value = await _valueAChar!.read();
+  void _readTimerOn() async {
+    if (_timerOnChar != null) {
+      List<int> value = await _timerOnChar!.read();
       if (value.length >= 4) {
         final intVal = ByteData.sublistView(Uint8List.fromList(value)).getUint32(0, Endian.little);
-        setState(() { _valueAController.text = intVal.toString(); });
+        setState(() { _timerOnController.text = intVal.toString(); });
       }
     }
   }
 
-  void _sendValueA() async {
-    if (_valueAChar != null && _valueAController.text.isNotEmpty) {
-      final int? val = int.tryParse(_valueAController.text);
+  void _sendTimerOn() async {
+    if (_timerOnChar != null && _timerOnController.text.isNotEmpty) {
+      final int? val = int.tryParse(_timerOnController.text);
       if (val != null) {
         final byteData = ByteData(4)..setUint32(0, val, Endian.little);
-        await _valueAChar!.write(byteData.buffer.asUint8List());
+        await _timerOnChar!.write(byteData.buffer.asUint8List());
       }
     }
   }
   
-  void _readValueB() async {
-    if (_valueBChar != null) {
-      List<int> value = await _valueBChar!.read();
+  void _readTimerOff() async {
+    if (_timerOffChar != null) {
+      List<int> value = await _timerOffChar!.read();
       if (value.length >= 4) {
         final intVal = ByteData.sublistView(Uint8List.fromList(value)).getUint32(0, Endian.little);
-        setState(() { _valueBController.text = intVal.toString(); });
+        setState(() { _timerOffController.text = intVal.toString(); });
       }
     }
   }
 
-  void _sendValueB() async {
-    if (_valueBChar != null && _valueBController.text.isNotEmpty) {
-      final int? val = int.tryParse(_valueBController.text);
+  void _sendTimerOff() async {
+    if (_timerOffChar != null && _timerOffController.text.isNotEmpty) {
+      final int? val = int.tryParse(_timerOffController.text);
       if (val != null) {
         final byteData = ByteData(4)..setUint32(0, val, Endian.little);
-        await _valueBChar!.write(byteData.buffer.asUint8List());
+        await _timerOffChar!.write(byteData.buffer.asUint8List());
+      }
+    }
+  }
+
+  Future<void> _checkPumpPowerVisibility(BluetoothCharacteristic char) async {
+    List<int> value = await char.read();
+    if (value.isNotEmpty && value[0] == 1) {
+      setState(() {
+        _showPumpPowerSection = true;
+      });
+      // If visible, read its initial value
+      _readPumpPower();
+    }
+  }
+
+  void _readPumpPower() async {
+    if (_pumpPowerChar != null) {
+      List<int> value = await _pumpPowerChar!.read();
+      if (value.isNotEmpty) {
+        // Convert byte (0-255) back to percentage
+        final percentage = (value[0] / 2.55).round();
+        setState(() {
+          _pumpPowerController.text = percentage.toString();
+        });
+      }
+    }
+  }
+
+  void _sendPumpPower() async {
+    if (_pumpPowerChar != null && _pumpPowerController.text.isNotEmpty) {
+      final int? percentage = int.tryParse(_pumpPowerController.text);
+      if (percentage != null && percentage >= 0 && percentage <= 100) {
+        // Convert percentage (0-100) to byte (0-255)
+        final valueToSend = (percentage * 2.55).round();
+        await _pumpPowerChar!.write([valueToSend]);
+      } else {
+        _showErrorDialog("Invalid Input", "Please enter a percentage between 0 and 100.");
       }
     }
   }
@@ -298,219 +341,240 @@ class _ESP32ControllerScreenState extends State<ESP32ControllerScreen> {
     );
   }
 
+  void _onTabTapped(int index) {
+    setState(() {
+      _selectedIndex = index;
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
+    final List<Widget> pages = _connectedDevice == null
+      ? [_buildConnectionPage()]
+      : [
+          _buildConnectionPage(),
+          _buildTimersPage(),
+          _buildDebugPage(),
+          _buildSystemPage(),
+        ];
+        
+    final List<BottomNavigationBarItem> navItems = _connectedDevice == null
+      ? [const BottomNavigationBarItem(icon: Icon(Icons.bluetooth), label: 'Connection')]
+      : [
+          const BottomNavigationBarItem(icon: Icon(Icons.bluetooth), label: 'Connection'),
+          const BottomNavigationBarItem(icon: Icon(Icons.timer), label: 'Timers'),
+          const BottomNavigationBarItem(icon: Icon(Icons.bug_report), label: 'Debug'),
+          const BottomNavigationBarItem(icon: Icon(Icons.info), label: 'System'),
+        ];
+
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('ESP32 Flutter Controller'),
         backgroundColor: Theme.of(context).scaffoldBackgroundColor,
         elevation: 0,
       ),
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.all(16.0),
-        child: Column(
-          children: [
-            _buildConnectionCard(),
-            if (_connectedDevice != null) ...[
-              const SizedBox(height: 16),
-              _buildValueSettingsCard(),
-              const SizedBox(height: 16),
-              _buildDataExchangeCard(),
-              const SizedBox(height: 16),
-              _buildDebugViewCard(),
-              const SizedBox(height: 16),
-              _buildSystemInfoCard(),
-            ],
-          ],
-        ),
+      body: IndexedStack(
+        index: _selectedIndex,
+        children: pages,
+      ),
+      bottomNavigationBar: BottomNavigationBar(
+        items: navItems,
+        currentIndex: _selectedIndex,
+        onTap: _onTabTapped,
       ),
     );
   }
 
-  Widget _buildConnectionCard() {
-    return Card(
-      elevation: 4,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-      child: Padding(
-        padding: const EdgeInsets.all(16.0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text('Connection', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
-            const SizedBox(height: 12),
-            Row(
-              children: [
-                Container(
-                  width: 12, height: 12,
-                  decoration: BoxDecoration(
-                    color: _connectedDevice != null ? Colors.green.shade400 : Colors.red.shade400,
-                    shape: BoxShape.circle,
+  // --- Page Widgets ---
+  
+  Widget _buildWrapper(Widget child) {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(16.0),
+      child: child,
+    );
+  }
+
+  Widget _buildConnectionPage() {
+    return _buildWrapper(
+      Card(
+        elevation: 4,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        child: Padding(
+          padding: const EdgeInsets.all(16.0),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('Connection', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  Container(
+                    width: 12, height: 12,
+                    decoration: BoxDecoration(
+                      color: _connectedDevice != null ? Colors.green.shade400 : Colors.red.shade400,
+                      shape: BoxShape.circle,
+                    ),
                   ),
-                ),
-                const SizedBox(width: 8),
-                Expanded(child: Text(_status, style: const TextStyle(fontSize: 16), overflow: TextOverflow.ellipsis,)),
-              ],
-            ),
-            const SizedBox(height: 12),
-            SizedBox(
-              width: double.infinity,
-              child: ElevatedButton(
-                onPressed: _connectedDevice != null ? _disconnectDevice : _scanAndConnect,
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Theme.of(context).primaryColor,
-                  padding: const EdgeInsets.symmetric(vertical: 12),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                ),
-                child: Text(_connectedDevice != null ? 'Disconnect' : 'Connect to ESP32', style: const TextStyle(fontSize: 16, color: Colors.white)),
+                  const SizedBox(width: 8),
+                  Expanded(child: Text(_status, style: const TextStyle(fontSize: 16), overflow: TextOverflow.ellipsis,)),
+                ],
               ),
-            ),
-          ],
+              const SizedBox(height: 12),
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton(
+                  onPressed: _connectedDevice != null ? _disconnectDevice : _scanAndConnect,
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Theme.of(context).primaryColor,
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                  ),
+                  child: Text(_connectedDevice != null ? 'Disconnect' : 'Connect to ESP32', style: const TextStyle(fontSize: 16, color: Colors.white)),
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
   }
 
-  Widget _buildValueSettingsCard() {
-    return Card(
-      elevation: 4,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-      child: Padding(
-        padding: const EdgeInsets.all(16.0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text('Numeric Values', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
-            const SizedBox(height: 16),
-            const Text('Value A', style: TextStyle(fontWeight: FontWeight.w600)),
-            const SizedBox(height: 8),
-            Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: _valueAController,
-                    keyboardType: TextInputType.number,
-                    decoration: const InputDecoration(border: OutlineInputBorder()),
+  Widget _buildTimersPage() {
+    return _buildWrapper(
+      Card(
+        elevation: 4,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        child: Padding(
+          padding: const EdgeInsets.all(16.0),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('Timer Settings', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 16),
+              const Text('Timer On', style: TextStyle(fontWeight: FontWeight.w600)),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _timerOnController,
+                      keyboardType: TextInputType.number,
+                      decoration: const InputDecoration(border: OutlineInputBorder()),
+                    ),
                   ),
-                ),
-                const SizedBox(width: 8),
-                ElevatedButton(onPressed: _sendValueA, child: const Text('Send')),
-                const SizedBox(width: 8),
-                IconButton(icon: const Icon(Icons.refresh), onPressed: _readValueA),
-              ],
-            ),
-            const SizedBox(height: 16),
-            const Text('Value B', style: TextStyle(fontWeight: FontWeight.w600)),
-            const SizedBox(height: 8),
-            Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: _valueBController,
-                    keyboardType: TextInputType.number,
-                    decoration: const InputDecoration(border: OutlineInputBorder()),
+                  const SizedBox(width: 8),
+                  ElevatedButton(onPressed: _sendTimerOn, child: const Text('Send')),
+                  const SizedBox(width: 8),
+                  IconButton(icon: const Icon(Icons.refresh), onPressed: _readTimerOn),
+                ],
+              ),
+              const SizedBox(height: 16),
+              const Text('Timer Off', style: TextStyle(fontWeight: FontWeight.w600)),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _timerOffController,
+                      keyboardType: TextInputType.number,
+                      decoration: const InputDecoration(border: OutlineInputBorder()),
+                    ),
                   ),
+                  const SizedBox(width: 8),
+                  ElevatedButton(onPressed: _sendTimerOff, child: const Text('Send')),
+                  const SizedBox(width: 8),
+                  IconButton(icon: const Icon(Icons.refresh), onPressed: _readTimerOff),
+                ],
+              ),
+              if (_showPumpPowerSection) ...[
+                const SizedBox(height: 16),
+                const Divider(),
+                const SizedBox(height: 16),
+                const Text('Puissance Pompe (%)', style: TextStyle(fontWeight: FontWeight.w600)),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: _pumpPowerController,
+                        keyboardType: const TextInputType.numberWithOptions(decimal: false),
+                        decoration: const InputDecoration(border: OutlineInputBorder(), hintText: '0-100'),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    ElevatedButton(onPressed: _sendPumpPower, child: const Text('Send')),
+                    const SizedBox(width: 8),
+                    IconButton(icon: const Icon(Icons.refresh), onPressed: _readPumpPower),
+                  ],
                 ),
-                const SizedBox(width: 8),
-                ElevatedButton(onPressed: _sendValueB, child: const Text('Send')),
-                const SizedBox(width: 8),
-                IconButton(icon: const Icon(Icons.refresh), onPressed: _readValueB),
               ],
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );
   }
   
-  Widget _buildDataExchangeCard() {
-    return Card(
-      elevation: 4,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-      child: Padding(
-        padding: const EdgeInsets.all(16.0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text('Data Exchange', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _dataToSendController,
-              decoration: const InputDecoration(labelText: 'Send Data', border: OutlineInputBorder()),
-            ),
-            const SizedBox(height: 8),
-            ElevatedButton(onPressed: _sendData, child: const Text('Send')),
-            const SizedBox(height: 16),
-            const Text('Received Data', style: TextStyle(fontWeight: FontWeight.w600)),
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.all(12),
-              margin: const EdgeInsets.only(top: 8),
-              decoration: BoxDecoration(color: Colors.black26, borderRadius: BorderRadius.circular(8)),
-              child: Text(_receivedData.isEmpty ? ' ' : _receivedData),
-            ),
-            const SizedBox(height: 8),
-            ElevatedButton(onPressed: _readData, child: const Text('Read')),
-          ],
-        ),
-      ),
-    );
-  }
-  
-  Widget _buildDebugViewCard() {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16.0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text('Debug View', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
-            const SizedBox(height: 12),
-            Container(
-              width: double.infinity,
-              height: 150,
-              padding: const EdgeInsets.all(12.0),
-              decoration: BoxDecoration(color: Colors.black, borderRadius: BorderRadius.circular(8)),
-              child: _debugData == null 
-                ? const Text('Waiting for debug data...', style: TextStyle(color: Colors.greenAccent))
-                : ListView(
-                    children: _debugData!.entries.map((entry) => Text(
-                        '${entry.key}: ${entry.value}',
-                        style: const TextStyle(color: Colors.greenAccent, fontFamily: 'monospace'),
-                    )).toList(),
-                  )
-            )
-          ]
+  Widget _buildDebugPage() {
+    return _buildWrapper(
+      Card(
+        child: Padding(
+          padding: const EdgeInsets.all(16.0),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('Debug View', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 12),
+              Container(
+                width: double.infinity,
+                height: 300, // Increased height for better viewing
+                padding: const EdgeInsets.all(12.0),
+                decoration: BoxDecoration(color: Colors.black, borderRadius: BorderRadius.circular(8)),
+                child: _debugData == null 
+                  ? const Text('Waiting for debug data...', style: TextStyle(color: Colors.greenAccent))
+                  : ListView(
+                      children: _debugData!.entries.map((entry) => Text(
+                          '${entry.key}: ${entry.value}',
+                          style: const TextStyle(color: Colors.greenAccent, fontFamily: 'monospace'),
+                      )).toList(),
+                    )
+              )
+            ]
+          )
         )
       )
     );
   }
   
-  Widget _buildSystemInfoCard() {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16.0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text('System Info', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
-            const SizedBox(height: 12),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                const Text('Uptime:', style: TextStyle(fontSize: 16)),
-                Text(_uptime, style: const TextStyle(fontSize: 18, fontFamily: 'monospace', fontWeight: FontWeight.bold)),
-              ],
-            ),
-            const SizedBox(height: 12),
-            SizedBox(
-              width: double.infinity,
-              child: ElevatedButton(
-                onPressed: _rebootDevice,
-                style: ElevatedButton.styleFrom(backgroundColor: Colors.red.shade700),
-                child: const Text('Reboot ESP32', style: TextStyle(color: Colors.white)),
+  Widget _buildSystemPage() {
+    return _buildWrapper(
+      Card(
+        child: Padding(
+          padding: const EdgeInsets.all(16.0),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('System Info', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 12),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  const Text('Uptime:', style: TextStyle(fontSize: 16)),
+                  Text(_uptime, style: const TextStyle(fontSize: 18, fontFamily: 'monospace', fontWeight: FontWeight.bold)),
+                ],
               ),
-            )
-          ],
+              const SizedBox(height: 12),
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton(
+                  onPressed: _rebootDevice,
+                  style: ElevatedButton.styleFrom(backgroundColor: Colors.red.shade700),
+                  child: const Text('Reboot ESP32', style: TextStyle(color: Colors.white)),
+                ),
+              )
+            ],
+          ),
         ),
       ),
     );
