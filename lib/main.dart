@@ -12,6 +12,9 @@ const String dataCharUuid = 'beb5483e-36e1-4688-b7f5-ea07361b26a8';
 const String debugCharUuid = 'f4a1f353-8576-4993-81b4-1101b0596348';
 const String uptimeCharUuid = 'a8f5f247-3665-448d-8a0c-6b3a2a3e592b';
 const String rebootCharUuid = 'b2d49a43-6c84-474c-a496-02d997e54f8e';
+const String onTimeCharUuid = 'c8a3cadd-536c-4819-9154-10a110a19a4e';
+const String offTimeCharUuid = 'd8a3cadd-536c-4819-9154-10a110a19a4f';
+
 
 void main() {
   runApp(const MyApp());
@@ -47,6 +50,8 @@ class _ESP32ControllerScreenState extends State<ESP32ControllerScreen> {
   StreamSubscription<BluetoothConnectionState>? _connectionStateSubscription;
   String _status = 'Disconnected';
   final TextEditingController _dataToSendController = TextEditingController();
+  final TextEditingController _valueAController = TextEditingController();
+  final TextEditingController _valueBController = TextEditingController();
   String _receivedData = '';
   Map<String, dynamic>? _debugData;
   String _uptime = '00:00:00';
@@ -54,6 +59,8 @@ class _ESP32ControllerScreenState extends State<ESP32ControllerScreen> {
   // --- Characteristics ---
   BluetoothCharacteristic? _dataChar;
   BluetoothCharacteristic? _rebootChar;
+  BluetoothCharacteristic? _valueAChar;
+  BluetoothCharacteristic? _valueBChar;
   StreamSubscription? _debugSubscription;
   StreamSubscription? _uptimeSubscription;
 
@@ -64,7 +71,6 @@ class _ESP32ControllerScreenState extends State<ESP32ControllerScreen> {
   }
 
   Future<void> _requestPermissions() async {
-    // Request multiple permissions at once.
     Map<Permission, PermissionStatus> statuses = await [
       Permission.bluetoothScan,
       Permission.bluetoothConnect,
@@ -85,41 +91,54 @@ class _ESP32ControllerScreenState extends State<ESP32ControllerScreen> {
     _uptimeSubscription?.cancel();
     _connectedDevice?.disconnect();
     _dataToSendController.dispose();
+    _valueAController.dispose();
+    _valueBController.dispose();
     super.dispose();
   }
 
-  // --- Core BLE Functions ---
   void _scanAndConnect() async {
-    var scanStatus = await Permission.bluetoothScan.status;
-    var locationStatus = await Permission.location.status;
-    if (!scanStatus.isGranted || !locationStatus.isGranted) {
-        _showErrorDialog('Permissions Required', 'Bluetooth Scan and Location permissions must be granted to find devices.');
-        _requestPermissions();
-        return;
+    var scanPerm = await Permission.bluetoothScan.status;
+    if (!scanPerm.isGranted) {
+      _showErrorDialog('Permissions Required', 'Bluetooth Scan permission must be granted to find devices.');
+      _requestPermissions();
+      return;
     }
 
     setState(() {
       _status = 'Scanning...';
     });
+    
+    StreamSubscription? scanSubscription;
 
     try {
+      scanSubscription = FlutterBluePlus.scanResults.listen((results) {
+        if (results.isNotEmpty) {
+          final device = results.first.device;
+          FlutterBluePlus.stopScan();
+          scanSubscription?.cancel();
+          _connectToDevice(device);
+        }
+      });
+
       await FlutterBluePlus.startScan(
         withServices: [Guid(esp32ServiceUuid)],
         timeout: const Duration(seconds: 15),
       );
-
-      FlutterBluePlus.scanResults.listen((results) {
-        if (results.isNotEmpty) {
-          final device = results.last.device;
-          FlutterBluePlus.stopScan();
-          _connectToDevice(device);
-        }
-      });
     } catch (e) {
-      _showErrorDialog('Scan Error', 'Could not start scanning. Please ensure Bluetooth and Location are enabled on your device.');
-      setState(() {
-        _status = 'Scan Failed';
-      });
+      _showErrorDialog('Scan Error', 'Could not start scanning. Error: ${e.toString()}');
+      setState(() { _status = 'Scan Failed'; });
+    }
+    
+    // Fallback in case scan times out
+    await Future.delayed(const Duration(seconds: 15));
+    if (_connectedDevice == null) {
+        FlutterBluePlus.stopScan();
+        scanSubscription?.cancel();
+        if(mounted) {
+            setState(() {
+                _status = 'No ESP32 device found.';
+            });
+        }
     }
   }
 
@@ -136,7 +155,7 @@ class _ESP32ControllerScreenState extends State<ESP32ControllerScreen> {
       });
       _onConnected(device);
     } catch (e) {
-      _showErrorDialog('Connection Error', 'Failed to connect to ${device.platformName}.');
+      _showErrorDialog('Connection Error', 'Failed to connect. Error: ${e.toString()}');
       _onDisconnected();
     }
   }
@@ -155,9 +174,14 @@ class _ESP32ControllerScreenState extends State<ESP32ControllerScreen> {
           if (char.uuid == Guid(rebootCharUuid)) _rebootChar = char;
           if (char.uuid == Guid(debugCharUuid)) _monitorDebug(char);
           if (char.uuid == Guid(uptimeCharUuid)) _monitorUptime(char);
+          if (char.uuid == Guid(onTimeCharUuid)) _valueAChar = char;
+          if (char.uuid == Guid(offTimeCharUuid)) _valueBChar = char;
         }
       }
     }
+    // Read initial values after connecting
+    _readValueA();
+    _readValueB();
   }
 
   void _onDisconnected() {
@@ -166,6 +190,8 @@ class _ESP32ControllerScreenState extends State<ESP32ControllerScreen> {
       _status = 'Disconnected';
       _debugData = null;
       _uptime = '00:00:00';
+      _valueAController.text = '';
+      _valueBController.text = '';
     });
     _debugSubscription?.cancel();
     _uptimeSubscription?.cancel();
@@ -175,20 +201,16 @@ class _ESP32ControllerScreenState extends State<ESP32ControllerScreen> {
     await _connectedDevice?.disconnect();
   }
 
-  // --- Characteristic Interactions ---
   void _sendData() async {
     if (_dataChar != null && _dataToSendController.text.isNotEmpty) {
-      List<int> bytes = utf8.encode(_dataToSendController.text);
-      await _dataChar!.write(bytes);
+      await _dataChar!.write(utf8.encode(_dataToSendController.text));
     }
   }
 
   void _readData() async {
     if (_dataChar != null) {
       List<int> value = await _dataChar!.read();
-      setState(() {
-        _receivedData = utf8.decode(value);
-      });
+      setState(() { _receivedData = utf8.decode(value); });
     }
   }
   
@@ -203,28 +225,64 @@ class _ESP32ControllerScreenState extends State<ESP32ControllerScreen> {
     _debugSubscription = char.lastValueStream.listen((value) {
       final jsonString = utf8.decode(value);
       try {
-        setState(() {
-          _debugData = jsonDecode(jsonString);
-        });
-      } catch (e) {
-        // Handle non-JSON data if necessary
-      }
+        setState(() { _debugData = jsonDecode(jsonString); });
+      } catch (e) { /* Ignore malformed JSON */ }
     });
   }
   
   void _monitorUptime(BluetoothCharacteristic char) async {
     await char.setNotifyValue(true);
     _uptimeSubscription = char.lastValueStream.listen((value) {
-      final secondsTotal = ByteData.sublistView(Uint8List.fromList(value)).getUint32(0, Endian.little);
-      final duration = Duration(seconds: secondsTotal);
-      String twoDigits(int n) => n.toString().padLeft(2, '0');
-      final hours = twoDigits(duration.inHours);
-      final minutes = twoDigits(duration.inMinutes.remainder(60));
-      final seconds = twoDigits(duration.inSeconds.remainder(60));
-      setState(() {
-        _uptime = '$hours:$minutes:$seconds';
-      });
+      if (value.length >= 4) {
+        final secondsTotal = ByteData.sublistView(Uint8List.fromList(value)).getUint32(0, Endian.little);
+        final duration = Duration(seconds: secondsTotal);
+        String twoDigits(int n) => n.toString().padLeft(2, '0');
+        final hours = twoDigits(duration.inHours);
+        final minutes = twoDigits(duration.inMinutes.remainder(60));
+        final seconds = twoDigits(duration.inSeconds.remainder(60));
+        setState(() { _uptime = '$hours:$minutes:$seconds'; });
+      }
     });
+  }
+
+  void _readValueA() async {
+    if (_valueAChar != null) {
+      List<int> value = await _valueAChar!.read();
+      if (value.length >= 4) {
+        final intVal = ByteData.sublistView(Uint8List.fromList(value)).getUint32(0, Endian.little);
+        setState(() { _valueAController.text = intVal.toString(); });
+      }
+    }
+  }
+
+  void _sendValueA() async {
+    if (_valueAChar != null && _valueAController.text.isNotEmpty) {
+      final int? val = int.tryParse(_valueAController.text);
+      if (val != null) {
+        final byteData = ByteData(4)..setUint32(0, val, Endian.little);
+        await _valueAChar!.write(byteData.buffer.asUint8List());
+      }
+    }
+  }
+  
+  void _readValueB() async {
+    if (_valueBChar != null) {
+      List<int> value = await _valueBChar!.read();
+      if (value.length >= 4) {
+        final intVal = ByteData.sublistView(Uint8List.fromList(value)).getUint32(0, Endian.little);
+        setState(() { _valueBController.text = intVal.toString(); });
+      }
+    }
+  }
+
+  void _sendValueB() async {
+    if (_valueBChar != null && _valueBController.text.isNotEmpty) {
+      final int? val = int.tryParse(_valueBController.text);
+      if (val != null) {
+        final byteData = ByteData(4)..setUint32(0, val, Endian.little);
+        await _valueBChar!.write(byteData.buffer.asUint8List());
+      }
+    }
   }
 
   void _showErrorDialog(String title, String content) {
@@ -240,7 +298,6 @@ class _ESP32ControllerScreenState extends State<ESP32ControllerScreen> {
     );
   }
 
-  // --- Widgets ---
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -255,6 +312,8 @@ class _ESP32ControllerScreenState extends State<ESP32ControllerScreen> {
           children: [
             _buildConnectionCard(),
             if (_connectedDevice != null) ...[
+              const SizedBox(height: 16),
+              _buildValueSettingsCard(),
               const SizedBox(height: 16),
               _buildDataExchangeCard(),
               const SizedBox(height: 16),
@@ -282,15 +341,14 @@ class _ESP32ControllerScreenState extends State<ESP32ControllerScreen> {
             Row(
               children: [
                 Container(
-                  width: 12,
-                  height: 12,
+                  width: 12, height: 12,
                   decoration: BoxDecoration(
                     color: _connectedDevice != null ? Colors.green.shade400 : Colors.red.shade400,
                     shape: BoxShape.circle,
                   ),
                 ),
                 const SizedBox(width: 8),
-                Text(_status, style: const TextStyle(fontSize: 16)),
+                Expanded(child: Text(_status, style: const TextStyle(fontSize: 16), overflow: TextOverflow.ellipsis,)),
               ],
             ),
             const SizedBox(height: 12),
@@ -311,6 +369,58 @@ class _ESP32ControllerScreenState extends State<ESP32ControllerScreen> {
       ),
     );
   }
+
+  Widget _buildValueSettingsCard() {
+    return Card(
+      elevation: 4,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      child: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('Numeric Values', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 16),
+            const Text('Value A', style: TextStyle(fontWeight: FontWeight.w600)),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _valueAController,
+                    keyboardType: TextInputType.number,
+                    decoration: const InputDecoration(border: OutlineInputBorder()),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                ElevatedButton(onPressed: _sendValueA, child: const Text('Send')),
+                const SizedBox(width: 8),
+                IconButton(icon: const Icon(Icons.refresh), onPressed: _readValueA),
+              ],
+            ),
+            const SizedBox(height: 16),
+            const Text('Value B', style: TextStyle(fontWeight: FontWeight.w600)),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _valueBController,
+                    keyboardType: TextInputType.number,
+                    decoration: const InputDecoration(border: OutlineInputBorder()),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                ElevatedButton(onPressed: _sendValueB, child: const Text('Send')),
+                const SizedBox(width: 8),
+                IconButton(icon: const Icon(Icons.refresh), onPressed: _readValueB),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
   
   Widget _buildDataExchangeCard() {
     return Card(
@@ -325,10 +435,7 @@ class _ESP32ControllerScreenState extends State<ESP32ControllerScreen> {
             const SizedBox(height: 12),
             TextField(
               controller: _dataToSendController,
-              decoration: const InputDecoration(
-                labelText: 'Send Data',
-                border: OutlineInputBorder(),
-              ),
+              decoration: const InputDecoration(labelText: 'Send Data', border: OutlineInputBorder()),
             ),
             const SizedBox(height: 8),
             ElevatedButton(onPressed: _sendData, child: const Text('Send')),
@@ -338,10 +445,7 @@ class _ESP32ControllerScreenState extends State<ESP32ControllerScreen> {
               width: double.infinity,
               padding: const EdgeInsets.all(12),
               margin: const EdgeInsets.only(top: 8),
-              decoration: BoxDecoration(
-                color: Colors.black26,
-                borderRadius: BorderRadius.circular(8),
-              ),
+              decoration: BoxDecoration(color: Colors.black26, borderRadius: BorderRadius.circular(8)),
               child: Text(_receivedData.isEmpty ? ' ' : _receivedData),
             ),
             const SizedBox(height: 8),
@@ -354,33 +458,30 @@ class _ESP32ControllerScreenState extends State<ESP32ControllerScreen> {
   
   Widget _buildDebugViewCard() {
     return Card(
-        child: Padding(
-            padding: const EdgeInsets.all(16.0),
-            child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                    const Text('Debug View', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
-                    const SizedBox(height: 12),
-                    Container(
-                        width: double.infinity,
-                        height: 150,
-                        padding: const EdgeInsets.all(12.0),
-                        decoration: BoxDecoration(
-                            color: Colors.black,
-                            borderRadius: BorderRadius.circular(8),
-                        ),
-                        child: _debugData == null 
-                            ? const Text('Waiting for debug data...', style: TextStyle(color: Colors.greenAccent))
-                            : ListView(
-                                children: _debugData!.entries.map((entry) => Text(
-                                    '${entry.key}: ${entry.value}',
-                                    style: const TextStyle(color: Colors.greenAccent, fontFamily: 'monospace'),
-                                )).toList(),
-                            )
-                    )
-                ]
+      child: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('Debug View', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 12),
+            Container(
+              width: double.infinity,
+              height: 150,
+              padding: const EdgeInsets.all(12.0),
+              decoration: BoxDecoration(color: Colors.black, borderRadius: BorderRadius.circular(8)),
+              child: _debugData == null 
+                ? const Text('Waiting for debug data...', style: TextStyle(color: Colors.greenAccent))
+                : ListView(
+                    children: _debugData!.entries.map((entry) => Text(
+                        '${entry.key}: ${entry.value}',
+                        style: const TextStyle(color: Colors.greenAccent, fontFamily: 'monospace'),
+                    )).toList(),
+                  )
             )
+          ]
         )
+      )
     );
   }
   
