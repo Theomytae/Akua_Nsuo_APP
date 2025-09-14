@@ -25,7 +25,7 @@
 
 
     <application
-        android:label="esp32_controller_flutter"
+        android:label="Akua Nsuo APP"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity

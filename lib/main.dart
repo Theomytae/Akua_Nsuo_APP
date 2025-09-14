@@ -13,10 +13,13 @@ const String uptimeCharUuid = 'a8f5f247-3665-448d-8a0c-6b3a2a3e592b';
 const String rebootCharUuid = 'b2d49a43-6c84-474c-a496-02d997e54f8e';
 const String onTimeCharUuid = 'c8a3cadd-536c-4819-9154-10a110a19a4e';
 const String offTimeCharUuid = 'd8a3cadd-536c-4819-9154-10a110a19a4f';
-// --- NEW UUIDs for Pump Power ---
-const String pumpPowerVisibilityCharUuid = 'e0c47e8c-838a-42d3-9b09-2495304e28e4';
+// This visibility characteristic is no longer needed but kept for reference
+// const String pumpPowerVisibilityCharUuid = 'e0c47e8c-838a-42d3-9b09-2495304e28e4';
 const String pumpPowerValueCharUuid = 'e1c47e8c-838a-42d3-9b09-2495304e28e5';
+const String pwmToggleCharUuid = 'e2c47e8c-838a-42d3-9b09-2495304e28e6';
 
+// --- NEW: Enum for time unit conversion ---
+enum TimeUnit { minutes, hours }
 
 void main() {
   runApp(const MyApp());
@@ -62,13 +65,18 @@ class _ESP32ControllerScreenState extends State<ESP32ControllerScreen> {
   Map<String, dynamic>? _debugData;
   String _uptime = '00:00:00';
   int _selectedIndex = 0;
-  bool _showPumpPowerSection = false;
+  bool _isPwmEnabled = false;
+  // --- NEW: State for time unit selection ---
+  TimeUnit _timerOnUnit = TimeUnit.minutes;
+  TimeUnit _timerOffUnit = TimeUnit.minutes;
+
 
   // --- Characteristics ---
   BluetoothCharacteristic? _rebootChar;
   BluetoothCharacteristic? _timerOnChar;
   BluetoothCharacteristic? _timerOffChar;
   BluetoothCharacteristic? _pumpPowerChar;
+  BluetoothCharacteristic? _pwmToggleChar;
   StreamSubscription? _debugSubscription;
   StreamSubscription? _uptimeSubscription;
 
@@ -175,7 +183,6 @@ class _ESP32ControllerScreenState extends State<ESP32ControllerScreen> {
     });
 
     List<BluetoothService> services = await device.discoverServices();
-    BluetoothCharacteristic? pumpVisibilityChar;
 
     for (var service in services) {
       if (service.uuid == Guid(esp32ServiceUuid)) {
@@ -186,18 +193,17 @@ class _ESP32ControllerScreenState extends State<ESP32ControllerScreen> {
           if (char.uuid == Guid(onTimeCharUuid)) _timerOnChar = char;
           if (char.uuid == Guid(offTimeCharUuid)) _timerOffChar = char;
           if (char.uuid == Guid(pumpPowerValueCharUuid)) _pumpPowerChar = char;
-          if (char.uuid == Guid(pumpPowerVisibilityCharUuid)) pumpVisibilityChar = char;
+          if (char.uuid == Guid(pwmToggleCharUuid)) _pwmToggleChar = char;
         }
       }
     }
 
-    // After finding characteristics, check for pump power visibility
-    if (pumpVisibilityChar != null) {
-      await _checkPumpPowerVisibility(pumpVisibilityChar);
-    }
-
     _readTimerOn();
     _readTimerOff();
+    await _readPwmState(); // Await this to ensure the state is known before reading power
+    if (_isPwmEnabled) {
+      _readPumpPower();
+    }
   }
 
   void _onDisconnected() {
@@ -209,8 +215,8 @@ class _ESP32ControllerScreenState extends State<ESP32ControllerScreen> {
       _timerOnController.text = '';
       _timerOffController.text = '';
       _pumpPowerController.text = '';
-      _showPumpPowerSection = false;
-      _selectedIndex = 0; // Reset to connection tab
+      _isPwmEnabled = false;
+      _selectedIndex = 0;
     });
     _debugSubscription?.cancel();
     _uptimeSubscription?.cancel();
@@ -265,7 +271,20 @@ class _ESP32ControllerScreenState extends State<ESP32ControllerScreen> {
     if (_timerOnChar != null && _timerOnController.text.isNotEmpty) {
       final int? val = int.tryParse(_timerOnController.text);
       if (val != null) {
-        final byteData = ByteData(4)..setUint32(0, val, Endian.little);
+        // --- NEW: Conversion logic ---
+        int millisToSend = 0;
+        if (_timerOnUnit == TimeUnit.minutes) {
+          millisToSend = val * 60 * 1000;
+        } else { // TimeUnit.hours
+          millisToSend = val * 60 * 60 * 1000;
+        }
+
+        if (millisToSend > 4294967295) {
+          _showErrorDialog("Value Too Large", "The converted millisecond value exceeds the 32-bit limit.");
+          return;
+        }
+        
+        final byteData = ByteData(4)..setUint32(0, millisToSend, Endian.little);
         await _timerOnChar!.write(byteData.buffer.asUint8List());
       }
     }
@@ -285,20 +304,22 @@ class _ESP32ControllerScreenState extends State<ESP32ControllerScreen> {
     if (_timerOffChar != null && _timerOffController.text.isNotEmpty) {
       final int? val = int.tryParse(_timerOffController.text);
       if (val != null) {
-        final byteData = ByteData(4)..setUint32(0, val, Endian.little);
+        // --- NEW: Conversion logic ---
+        int millisToSend = 0;
+        if (_timerOffUnit == TimeUnit.minutes) {
+          millisToSend = val * 60 * 1000;
+        } else { // TimeUnit.hours
+          millisToSend = val * 60 * 60 * 1000;
+        }
+
+        if (millisToSend > 4294967295) {
+          _showErrorDialog("Value Too Large", "The converted millisecond value exceeds the 32-bit limit.");
+          return;
+        }
+
+        final byteData = ByteData(4)..setUint32(0, millisToSend, Endian.little);
         await _timerOffChar!.write(byteData.buffer.asUint8List());
       }
-    }
-  }
-
-  Future<void> _checkPumpPowerVisibility(BluetoothCharacteristic char) async {
-    List<int> value = await char.read();
-    if (value.isNotEmpty && value[0] == 1) {
-      setState(() {
-        _showPumpPowerSection = true;
-      });
-      // If visible, read its initial value
-      _readPumpPower();
     }
   }
 
@@ -306,7 +327,6 @@ class _ESP32ControllerScreenState extends State<ESP32ControllerScreen> {
     if (_pumpPowerChar != null) {
       List<int> value = await _pumpPowerChar!.read();
       if (value.isNotEmpty) {
-        // Convert byte (0-255) back to percentage
         final percentage = (value[0] / 2.55).round();
         setState(() {
           _pumpPowerController.text = percentage.toString();
@@ -319,12 +339,31 @@ class _ESP32ControllerScreenState extends State<ESP32ControllerScreen> {
     if (_pumpPowerChar != null && _pumpPowerController.text.isNotEmpty) {
       final int? percentage = int.tryParse(_pumpPowerController.text);
       if (percentage != null && percentage >= 0 && percentage <= 100) {
-        // Convert percentage (0-100) to byte (0-255)
         final valueToSend = (percentage * 2.55).round();
         await _pumpPowerChar!.write([valueToSend]);
       } else {
         _showErrorDialog("Invalid Input", "Please enter a percentage between 0 and 100.");
       }
+    }
+  }
+
+  Future<void> _readPwmState() async {
+    if (_pwmToggleChar != null) {
+      List<int> value = await _pwmToggleChar!.read();
+      if (value.isNotEmpty) {
+        setState(() {
+          _isPwmEnabled = value[0] == 1;
+        });
+      }
+    }
+  }
+
+  void _sendPwmState(bool isEnabled) async {
+    if (_pwmToggleChar != null) {
+      await _pwmToggleChar!.write([isEnabled ? 1 : 0]);
+      setState(() {
+        _isPwmEnabled = isEnabled;
+      });
     }
   }
 
@@ -467,6 +506,18 @@ class _ESP32ControllerScreenState extends State<ESP32ControllerScreen> {
                   ElevatedButton(onPressed: _sendTimerOn, child: const Text('Send')),
                   const SizedBox(width: 8),
                   IconButton(icon: const Icon(Icons.refresh), onPressed: _readTimerOn),
+                  // --- NEW: Unit selection menu ---
+                  PopupMenuButton<TimeUnit>(
+                    onSelected: (unit) => setState(() => _timerOnUnit = unit),
+                    itemBuilder: (context) => [
+                      const PopupMenuItem(value: TimeUnit.minutes, child: Text("Minutes")),
+                      const PopupMenuItem(value: TimeUnit.hours, child: Text("Hours")),
+                    ],
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 8.0),
+                      child: Text(_timerOnUnit == TimeUnit.minutes ? 'mins' : 'hrs', style: const TextStyle(fontWeight: FontWeight.bold)),
+                    ),
+                  ),
                 ],
               ),
               const SizedBox(height: 16),
@@ -485,9 +536,21 @@ class _ESP32ControllerScreenState extends State<ESP32ControllerScreen> {
                   ElevatedButton(onPressed: _sendTimerOff, child: const Text('Send')),
                   const SizedBox(width: 8),
                   IconButton(icon: const Icon(Icons.refresh), onPressed: _readTimerOff),
+                   // --- NEW: Unit selection menu ---
+                  PopupMenuButton<TimeUnit>(
+                    onSelected: (unit) => setState(() => _timerOffUnit = unit),
+                    itemBuilder: (context) => [
+                      const PopupMenuItem(value: TimeUnit.minutes, child: Text("Minutes")),
+                      const PopupMenuItem(value: TimeUnit.hours, child: Text("Hours")),
+                    ],
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 8.0),
+                      child: Text(_timerOffUnit == TimeUnit.minutes ? 'mins' : 'hrs', style: const TextStyle(fontWeight: FontWeight.bold)),
+                    ),
+                  ),
                 ],
               ),
-              if (_showPumpPowerSection) ...[
+              if (_isPwmEnabled) ...[
                 const SizedBox(height: 16),
                 const Divider(),
                 const SizedBox(height: 16),
@@ -528,7 +591,7 @@ class _ESP32ControllerScreenState extends State<ESP32ControllerScreen> {
               const SizedBox(height: 12),
               Container(
                 width: double.infinity,
-                height: 300, // Increased height for better viewing
+                height: 300,
                 padding: const EdgeInsets.all(12.0),
                 decoration: BoxDecoration(color: Colors.black, borderRadius: BorderRadius.circular(8)),
                 child: _debugData == null 
@@ -539,7 +602,20 @@ class _ESP32ControllerScreenState extends State<ESP32ControllerScreen> {
                           style: const TextStyle(color: Colors.greenAccent, fontFamily: 'monospace'),
                       )).toList(),
                     )
-              )
+              ),
+              const SizedBox(height: 8),
+              ExpansionTile(
+                title: const Text("Advanced Settings"),
+                children: [
+                  ListTile(
+                    title: const Text("Enable PWM"),
+                    trailing: Switch(
+                      value: _isPwmEnabled,
+                      onChanged: _sendPwmState,
+                    ),
+                  ),
+                ],
+              ),
             ]
           )
         )

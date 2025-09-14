@@ -91,6 +91,9 @@ unsigned long lastUptimeNotifyTime = 0;
 unsigned long lastDebugNotifyTime = 0;
 const long uptimeNotifyInterval = 1000; // 1 second
 const long debugNotifyInterval = 2000;  // 2 seconds
+unsigned long lastDisconnectTime = 0;
+const unsigned long bleTimeout = 300000; // 5 minutes in milliseconds
+bool bleIsActive = true;
 
 // For NVS
 Preferences preferences;
@@ -102,12 +105,14 @@ class MyServerCallbacks : public BLEServerCallbacks {
     deviceConnected = true;
     digitalWrite(comLed, HIGH); // Turn on communication LED
     Serial.println("Client Connected");
+    lastDisconnectTime = 0; // Reset the timeout timer
   }
 
   void onDisconnect(BLEServer* pServer) {
     deviceConnected = false;
     digitalWrite(comLed, LOW); // Turn off communication LED
-    Serial.println("Client Disconnected");
+    Serial.println("Client Disconnected. Starting 5-minute BLE timeout.");
+    lastDisconnectTime = millis(); // Start the timeout timer
     pServer->getAdvertising()->start();
   }
 };
@@ -316,11 +321,20 @@ void setup() {
   BLEAdvertising *pAdvertising = pServer->getAdvertising();
   pAdvertising->addServiceUUID(SERVICE_UUID);
   pAdvertising->start();
-
+  lastDisconnectTime = millis(); // Start the 5-minute timeout on boot
   Serial.println("BLE Server started. Waiting for a client connection...");
 }
 
 void loop() {
+  // --- BLE Timeout Logic ---
+  // If BLE is active, no device is connected, and 5 minutes have passed since the last disconnect
+  if (bleIsActive && !deviceConnected && lastDisconnectTime != 0 && (millis() - lastDisconnectTime > bleTimeout)) {
+    Serial.println("5-minute BLE timeout reached. Stopping BLE advertising.");
+    BLEDevice::getAdvertising()->stop();
+    bleIsActive = false; // Mark BLE as inactive to prevent this from running again
+    // Note: To re-enable BLE, the device will need to be rebooted.
+  }
+
   // --- Core Hardware Logic (runs continuously) ---
   myTime = millis();
   floater = digitalRead(SW1R);
